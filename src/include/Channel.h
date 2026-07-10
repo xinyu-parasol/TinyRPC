@@ -3,6 +3,7 @@
 
 #include <google/protobuf/service.h>
 #include <string>
+#include <vector>
 
 class EtcdClient;
 
@@ -20,16 +21,17 @@ public:
                     google::protobuf::Message *response,
                     google::protobuf::Closure *done) override;
 private:
-    bool ResolveService();
-    int connect();
+    bool ResolveAllInstances();
 
     std::string m_ip;
     uint16_t m_port = 0;
 
     // Service discovery mode
     bool m_use_discovery = false;
+    bool m_resolved = false;
     std::string m_service_name;
     EtcdClient *m_etcd_client = nullptr;
+    std::vector<std::string> m_instances;
 };
 
 #endif

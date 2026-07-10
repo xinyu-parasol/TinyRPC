@@ -6,6 +6,8 @@
 #include <netinet/in.h>
 #include <arpa/inet.h>
 #include <unistd.h>
+#include <cstdlib>
+#include <ctime>
 
 Channel::Channel(const std::string &ip, uint16_t port)
     : m_ip(ip), m_port(port) {
@@ -15,29 +17,34 @@ Channel::Channel(const std::string &service_name, EtcdClient *etcd_client)
     : m_use_discovery(true)
     , m_service_name(service_name)
     , m_etcd_client(etcd_client) {
+    std::srand(std::time(nullptr));
 }
 
 Channel::~Channel() {
 }
 
-bool Channel::ResolveService() {
-    std::string etcd_key = "/tinyrpc/" + m_service_name;
-    std::string addr = m_etcd_client->DiscoverService(etcd_key);
-    if (addr.empty()) {
-        fprintf(stderr, "[Channel] Service not found: %s\n", m_service_name.c_str());
+bool Channel::ResolveAllInstances() {
+    m_instances = m_etcd_client->ListInstances(m_service_name);
+    if (m_instances.empty()) {
+        fprintf(stderr, "[Channel] No instances found for: %s\n", m_service_name.c_str());
         return false;
     }
 
+    printf("[Channel] Discovered %zu instances for %s\n",
+           m_instances.size(), m_service_name.c_str());
+    for (size_t i = 0; i < m_instances.size(); ++i) {
+        printf("[Channel]   [%zu] %s\n", i, m_instances[i].c_str());
+    }
+
+    m_resolved = true;
+    return true;
+}
+
+static bool ParseAddr(const std::string &addr, std::string &ip, uint16_t &port) {
     size_t colon = addr.find(':');
-    if (colon == std::string::npos) {
-        fprintf(stderr, "[Channel] Invalid address: %s\n", addr.c_str());
-        return false;
-    }
-
-    m_ip = addr.substr(0, colon);
-    m_port = static_cast<uint16_t>(std::stoi(addr.substr(colon + 1)));
-    printf("[Channel] Discovered %s -> %s:%d\n",
-           m_service_name.c_str(), m_ip.c_str(), m_port);
+    if (colon == std::string::npos) return false;
+    ip = addr.substr(0, colon);
+    port = static_cast<uint16_t>(std::stoi(addr.substr(colon + 1)));
     return true;
 }
 
@@ -47,12 +54,22 @@ void Channel::CallMethod(const google::protobuf::MethodDescriptor *method,
                          google::protobuf::Message *response,
                          google::protobuf::Closure *done) {
 
-    if (m_use_discovery) {
-        if (!ResolveService()) {
+    // Service discovery: resolve all instances on first call
+    if (m_use_discovery && !m_resolved) {
+        if (!ResolveAllInstances()) {
             controller->SetFailed("service discovery failed");
             return;
         }
-        m_use_discovery = false;
+    }
+
+    // Pick a random instance on every call (load balancing)
+    if (m_use_discovery && m_resolved && !m_instances.empty()) {
+        size_t idx = std::rand() % m_instances.size();
+        if (!ParseAddr(m_instances[idx], m_ip, m_port)) {
+            controller->SetFailed("parse address failed");
+            return;
+        }
+        printf("[Channel] Selected instance [%zu] %s:%d\n", idx, m_ip.c_str(), m_port);
     }
 
     int sockfd = ::socket(AF_INET, SOCK_STREAM, 0);

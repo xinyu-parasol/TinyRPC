@@ -575,6 +575,239 @@ std::string id_str = ExtractJsonUint64(resp, "ID");  // 错误
 
 ---
 
+## Step 7 — 负载均衡（多实例）
+
+### 问题
+
+之前的服务发现只能查到**一个**实例。如果有多个 Server 同时提供服务，客户端永远只连第一个查到的。
+
+```
+etcd 里只有一个 key：/tinyrpc/UserServiceRpc → "127.0.0.1:10000"
+新 Server 注册会覆盖旧的，旧的"消失"
+```
+
+### 设计思路
+
+每个实例用**独立的 key** 注册，客户端通过**前缀扫描**查出所有实例，再随机选一个来连接。
+
+```
+注册格式变化：
+  之前: /tinyrpc/demo.UserServiceRpc  →  "127.0.0.1:10000"     ← 大家抢同一个 key
+  现在: /tinyrpc/demo.UserServiceRpc/127.0.0.1:10000  →  ""   ← 每个实例独享 key
+        /tinyrpc/demo.UserServiceRpc/127.0.0.1:10001  →  ""
+
+客户端前缀查询：
+  POST /v3/kv/range
+  { "key": base64("/tinyrpc/demo.UserServiceRpc/"),
+    "range_end": base64("/tinyrpc/demo.UserServiceRpc0") }  ← 范围查询
+
+  返回 ["127.0.0.1:10000", "127.0.0.1:10001"]
+  随机选一个 → connect → RPC
+```
+
+### etcd 的前缀扫描（range_end）
+
+etcd v3 没有单独的"前缀查询"API，用 `range_end` 来模拟：
+
+```cpp
+static std::string GetRangeEnd(const std::string &prefix) {
+    std::string end = prefix;
+    end.back() = static_cast<char>(
+        static_cast<unsigned char>(end.back()) + 1
+    );
+    return end;
+}
+// 比如 prefix = "/tinyrpc/UserServiceRpc/"
+// range_end = "/tinyrpc/UserServiceRpc0"
+// 因为 '/' (0x2F) + 1 = '0' (0x30)
+```
+
+### 代码改动
+
+**EtcdClient — 新增 GetByPrefix / ListInstances**
+
+```cpp
+// EtcdClient.h
+std::vector<std::string> GetByPrefix(const std::string &prefix);
+std::vector<std::string> ListInstances(const std::string &service_name);
+
+// EtcdClient.cc
+std::vector<std::string> EtcdClient::GetByPrefix(const std::string &prefix) {
+    std::string range_end = GetRangeEnd(prefix);
+    std::string body = "{\"key\":\"" + Base64Encode(prefix)
+                      + "\",\"range_end\":\"" + Base64Encode(range_end) + "\"}";
+    std::string resp = HttpPost("/v3/kv/range", body);
+    return ExtractAllKvsValues(resp);  // 解析 JSON 中所有 "value"
+}
+```
+
+**Provider — 注册 key 改为带地址后缀**
+
+```cpp
+// 之前: /tinyrpc/demo.UserServiceRpc
+// 现在: /tinyrpc/demo.UserServiceRpc/127.0.0.1:10000
+std::string etcd_key = "/tinyrpc/" + full_name + "/" + addr;
+m_etcd_client->RegisterService(etcd_key, addr, 10);
+```
+
+**Channel — 负载均衡**
+
+```cpp
+// 首次调用时列出所有实例
+m_instances = m_etcd_client->ListInstances(m_service_name);
+
+// 每次 CallMethod 随机选一个
+size_t idx = std::rand() % m_instances.size();
+ParseAddr(m_instances[idx], m_ip, m_port);
+// connect to m_ip:m_port → send RPC
+```
+
+**示例客户端 — 循环 6 次调用**
+
+```cpp
+for (int i = 0; i < 6; ++i) {
+    stub.Login(...);
+    // 每次随机走向不同的 Server
+}
+```
+
+### 运行结果
+
+```bash
+# 终端 1: etcd
+etcd --data-dir /tmp/etcd-data
+
+# 终端 2: Server1 (10000)
+./build/example/server/server -i conf/tinyrpc.conf
+
+# 终端 3: Server2 (10001)
+./build/example/server/server -i conf/tinyrpc2.conf
+
+# 终端 4: Client
+./build/example/client/client -i conf/tinyrpc.conf
+```
+
+**客户端输出（负载均衡效果）：**
+```
+--- Call 1 ---
+[Channel] Discovered 2 instances for demo.UserServiceRpc
+[Channel]   [0] 127.0.0.1:10000
+[Channel]   [1] 127.0.0.1:10001
+[Channel] Selected instance [0] 127.0.0.1:10000
+Response: success=1, errcode=0, errmsg=OK
+
+--- Call 2 ---
+[Channel] Selected instance [1] 127.0.0.1:10001   ← 这次去了另一个
+Response: success=1, errcode=0, errmsg=OK
+
+--- Call 3~6 ---
+... 随机分布，两个 Server 各处理约一半请求
+```
+
+**Server1 (10000) 日志：**
+```
+[UserService:10000] Login called: name=admin, pwd=123456   ← 3 次
+```
+
+**Server2 (10001) 日志：**
+```
+[UserService:10001] Login called: name=admin, pwd=123456   ← 3 次
+```
+
+---
+
+## 还可以做什么？
+
+### 1. 连接池（Connection Pool）
+
+当前每次 `CallMethod` 都 `socket()` + `connect()` + `send/recv` + `close()`。效率很低。
+
+**优化方向：**
+- 提前建立一批 TCP 连接到 Server，用完后放回池里
+- 避免重复三次握手四次挥手
+- 典型实现：`std::vector<int> m_pool`，取一个用、用完归还
+
+### 2. 异步 RPC（Async RPC）
+
+目前 `CallMethod` 是**同步阻塞**的，等 Server 返回期间客户端啥也干不了。
+
+**优化方向：**
+- protobuf 的 `Closure done` 参数现在传 `nullptr`，实际可以用来做回调
+- 发起 RPC 后立即返回，等响应到了再回调你的函数
+- 需要配合 Reactor 模型（muduo 的 EventLoop）
+
+### 3. 超时机制
+
+当前 RPC 没有超时，Server 挂了客户端会一直卡在 `recv`。
+
+**优化方向：**
+- `setsockopt(SO_RCVTIMEO)` 设置 recv 超时
+- 或在 Channel 里加一个 `m_timeout_ms` 成员
+- 超时后 `SetFailed("timeout")` 并 close socket
+
+### 4. 传输压缩
+
+大数据量场景下（比如传一张图片），protobuf 序列化后可能还有几百 KB。
+
+**优化方向：**
+- 发送前用 snappy / zstd / gzip 压缩
+- 响应头里加一个 `compress_type` 字段
+- Server 收到后先解压再反序列化
+
+### 5. 更多负载均衡策略
+
+当前只有随机（`std::rand() % N`），还可以：
+
+| 策略 | 描述 | 适用场景 |
+|------|------|----------|
+| **Round Robin** | 轮流选，`++idx % N` | 各实例性能相当 |
+| **Weighted Random** | 按权重随机（权重高的概率大） | 实例配置不同（4c8g vs 8c16g） |
+| **Least Connections** | 选当前活跃连接最少的 | 长连接场景 |
+| **Consistent Hashing** | 相同请求参数永远路由到同一台 | 需要缓存命中 |
+
+### 6. 健康检查 + 自动摘除
+
+当前如果某个 Server 挂了，客户端仍然可能随机选到它，然后 `connect()` 失败。
+
+**优化方向：**
+- 每次 RPC 失败时，把该实例标记"不可用"
+- 连续失败 N 次后，从 `m_instances` 中临时移除
+- 定时尝试重连已移除的实例
+- 或者：服务端注册的 key 带 TTL，宕机后 key 自动过期，客户端自然就查不到了（目前已有，但客户端缓存了列表不会更新）
+
+### 7. 动态更新实例列表
+
+当前 `ResolveAllInstances()` 只在首次调用时执行一次，后面一直用缓存的列表。新 Server 上线或旧 Server 下线，客户端感知不到。
+
+**优化方向：**
+- 每个 N 秒重新查询 etcd，刷新 `m_instances`
+- 或者用 etcd watch API（长轮询监听 key 变化）
+
+### 8. 配置中心
+
+直接把 `conf/tinyrpc.conf` 的内容搬到 etcd 里，程序启动时从 etcd 拉配置。
+
+**优势：**
+- 修改配置不需要重启服务
+- 所有服务共享一套配置
+
+### 9. 链路追踪（Trace ID）
+
+给每次 RPC 请求分配一个全局唯一的 `trace_id`，在客户端、服务端之间透传。
+
+**用途：**
+- 排查问题：一次 RPC 慢在哪？
+- 微服务调用链可视化
+
+### 10. 跨语言 / gRPC
+
+当前框架只支持 C++ 到 C++。如果以后要接 Go/Python 服务，可以考虑：
+
+- **方案 A**：改用 gRPC（protobuf 原生支持多语言）
+- **方案 B**：自己定义跨语言协议（用 JSON 或 FlatBuffers）
+
+---
+
 # 文件说明
 
 | 文件 | 作用 |
@@ -584,9 +817,10 @@ std::string id_str = ExtractJsonUint64(resp, "ID");  // 错误
 | `src/header.proto` | RPC 通信协议定义 |
 | `src/include/EtcdClient.h` | etcd 客户端（服务发现） |
 | `src/EtcdClient.cc` | etcd v3 HTTP API 封装 |
-| `conf/tinyrpc.conf` | 运行时配置 |
+| `conf/tinyrpc.conf` | 运行时配置（实例1） |
+| `conf/tinyrpc2.conf` | 运行时配置（实例2，端口 10001） |
 | `demo/user.proto` | 示例业务协议定义 |
 | `example/user_service.h` | 手动实现的 protobuf 服务类 |
 | `example/server/main.cc` | RPC 服务端示例（含 etcd 注册） |
-| `example/client/main.cc` | RPC 客户端示例（含 etcd 发现） |
+| `example/client/main.cc` | RPC 客户端示例（含 etcd 发现 + 负载均衡） |
 | `.gitignore` | 排除 build、IDE 等临时文件 |

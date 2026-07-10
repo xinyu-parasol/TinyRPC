@@ -15,16 +15,19 @@ int main(int argc, char **argv) {
     request.set_name("admin");
     request.set_pwd("123456");
 
-    demo::LoginResponse response;
-    Controller controller;
+    for (int i = 0; i < 6; ++i) {
+        demo::LoginResponse response;
+        Controller controller;
 
-    stub.Login(&controller, &request, &response, nullptr);
+        printf("\n--- Call %d ---\n", i + 1);
+        stub.Login(&controller, &request, &response, nullptr);
 
-    if (controller.Failed()) {
-        printf("RPC call failed: %s\n", controller.ErrorText().c_str());
-    } else {
-        printf("Response: success=%d, errcode=%d, errmsg=%s\n",
-               response.success(), response.errcode(), response.errmsg().c_str());
+        if (controller.Failed()) {
+            printf("RPC call failed: %s\n", controller.ErrorText().c_str());
+        } else {
+            printf("Response: success=%d, errcode=%d, errmsg=%s\n",
+                   response.success(), response.errcode(), response.errmsg().c_str());
+        }
     }
 
     return 0;

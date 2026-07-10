@@ -12,11 +12,12 @@ public:
         (void)controller;
         (void)done;
 
-        std::string name = request->name();
-        std::string pwd = request->pwd();
+    std::string name = request->name();
+    std::string pwd = request->pwd();
 
-        printf("[UserService] Login called: name=%s, pwd=%s\n",
-               name.c_str(), pwd.c_str());
+    printf("[UserService:%s] Login called: name=%s, pwd=%s\n",
+           Application::GetConfig().Load("rpc_server_port").c_str(),
+           name.c_str(), pwd.c_str());
 
         if (name == "admin" && pwd == "123456") {
             response->set_success(true);

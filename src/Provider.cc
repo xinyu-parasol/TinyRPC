@@ -57,7 +57,8 @@ void Provider::Run() {
         std::string addr = ip + ":" + std::to_string(port);
         for (auto &entry : service_map) {
             std::string full_name = entry.second.service->GetDescriptor()->full_name();
-            std::string etcd_key = "/tinyrpc/" + full_name;
+            // 每个实例独立 key: /tinyrpc/ServiceName/address
+            std::string etcd_key = "/tinyrpc/" + full_name + "/" + addr;
             m_etcd_client->RegisterService(etcd_key, addr, 10);
         }
         event_loop.runEvery(5.0, std::bind(&Provider::Heartbeat, this));

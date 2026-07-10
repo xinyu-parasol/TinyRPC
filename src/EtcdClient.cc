@@ -255,6 +255,47 @@ std::string EtcdClient::DiscoverService(const std::string &key) {
     return Get(key);
 }
 
+static std::string GetRangeEnd(const std::string &prefix) {
+    if (prefix.empty()) return "";
+    std::string end = prefix;
+    end.back() = static_cast<char>(static_cast<unsigned char>(end.back()) + 1);
+    return end;
+}
+
+static std::vector<std::string> ExtractAllKvsValues(const std::string &json) {
+    std::vector<std::string> result;
+    size_t kvs_start = json.find("\"kvs\":[");
+    if (kvs_start == std::string::npos) return result;
+
+    std::string target = "\"value\":\"";
+    size_t pos = kvs_start;
+    while ((pos = json.find(target, pos)) != std::string::npos) {
+        pos += target.size();
+        std::string value_b64;
+        while (pos < json.size() && json[pos] != '"') {
+            value_b64 += json[pos++];
+        }
+        if (!value_b64.empty()) {
+            result.push_back(EtcdClient::Base64Decode(value_b64));
+        }
+        if (pos < json.size()) pos++;
+    }
+    return result;
+}
+
+std::vector<std::string> EtcdClient::GetByPrefix(const std::string &prefix) {
+    std::string range_end = GetRangeEnd(prefix);
+    std::string body = "{\"key\":\"" + Base64Encode(prefix) + "\",\"range_end\":\"" + Base64Encode(range_end) + "\"}";
+    std::string resp = HttpPost("/v3/kv/range", body);
+    if (resp.empty()) return {};
+    return ExtractAllKvsValues(resp);
+}
+
+std::vector<std::string> EtcdClient::ListInstances(const std::string &service_name) {
+    std::string prefix = "/tinyrpc/" + service_name + "/";
+    return GetByPrefix(prefix);
+}
+
 void EtcdClient::KeepAliveAll() {
     for (auto &entry : active_leases_) {
         KeepAliveLease(entry.second.lease_id);
