@@ -1,0 +1,20 @@
+syntax = "proto3";               // 使用 proto3 语法
+package demo;                    // 包名，防止命名冲突
+
+// 定义 Login 请求：包含用户名和密码
+message LoginRequest {
+    string name = 1;             // 等号后的数字是字段编号，不是值
+    string pwd = 2;
+}
+
+// 定义 Login 响应：返回错误码和提示消息
+message LoginResponse {
+    int32 errcode = 1;
+    string errmsg = 2;
+    bool success = 3;
+}
+
+// 定义一个 RPC 服务（接口描述）
+service UserServiceRpc {
+    rpc Login(LoginRequest) returns (LoginResponse);
+}
