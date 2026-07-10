@@ -1,5 +1,6 @@
 #include "Provider.h"
 #include "Application.h"
+#include "EtcdClient.h"
 #include "user_service.h"
 
 class UserService : public demo::UserServiceRpc {
@@ -32,8 +33,11 @@ public:
 int main(int argc, char **argv) {
     Application::Init(argc, argv);
 
+    EtcdClient etcd_client("127.0.0.1", 2379);
     UserService service;
     Provider provider;
+
+    provider.SetEtcdClient(&etcd_client);
     provider.NotifyService(&service);
 
     provider.Run();

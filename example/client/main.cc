@@ -1,12 +1,14 @@
 #include "Channel.h"
 #include "Controller.h"
 #include "Application.h"
+#include "EtcdClient.h"
 #include "user_service.h"
 
 int main(int argc, char **argv) {
     Application::Init(argc, argv);
 
-    Channel channel("127.0.0.1", 10000);
+    EtcdClient etcd_client("127.0.0.1", 2379);
+    Channel channel("demo.UserServiceRpc", &etcd_client);
     demo::UserServiceRpc_Stub stub(&channel);
 
     demo::LoginRequest request;

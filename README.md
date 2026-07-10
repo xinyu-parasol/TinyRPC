@@ -442,16 +442,151 @@ Response: success=1, errcode=0, errmsg=OK
 
 ---
 
+## Step 6 — etcd 服务发现
+
+### 为什么需要服务发现
+
+之前客户端写死了服务器地址：
+```cpp
+Channel channel("127.0.0.1", 10000);
+```
+
+这有几个问题：
+- 如果服务器换机器了，IP 变了 → 要改客户端代码
+- 如果有多个服务器实例 → 无法做负载均衡
+- 如果服务器挂了 → 客户端不知道
+
+**服务发现**就是让客户端通过"服务名"找到服务器的地址，而不是硬编码 IP。
+
+### etcd 简介
+
+etcd 是一个分布式键值存储，用来做服务发现正合适：
+- **Put(key, value, lease)**：存一个键值对，带租约（TTL）
+- **Get(key)**：查一个键的值
+- **Lease Grant/KeepAlive**：创建租约，定期续约
+
+服务端注册：
+```
+/tinyrpc/demo.UserServiceRpc  →  "0.0.0.0:10000"  (TTL=10s, 每5秒续约)
+```
+
+客户端查询：
+```
+/tinyrpc/demo.UserServiceRpc  →  "0.0.0.0:10000"  → 连接过去
+```
+
+### EtcdClient 类设计
+
+```
+EtcdClient
+├── RegisterService(key, value, ttl)     ← 注册服务（自动 GrantLease + Put）
+├── UnregisterService(key)               ← 取消注册
+├── DiscoverService(key)                 ← 发现服务
+└── KeepAliveAll()                       ← 续约所有活跃租约
+    ↓
+底层：
+├── HttpPost /v3/kv/put                  ← etcd v3 HTTP API
+├── HttpPost /v3/kv/range
+├── HttpPost /v3/lease/grant
+└── HttpPost /v3/lease/keepalive
+```
+
+### Provider 集成
+
+```cpp
+class Provider {
+    EtcdClient *m_etcd_client = nullptr;
+    
+    void SetEtcdClient(EtcdClient *client);  // 设置 etcd 客户端
+    
+    void Run() {
+        // ... 启动 muduo TcpServer ...
+        
+        if (m_etcd_client) {
+            // 注册所有服务到 etcd
+            for (auto &entry : service_map) {
+                m_etcd_client->RegisterService(key, addr, 10);
+            }
+            // 每 5 秒心跳续约
+            event_loop.runEvery(5.0, &Provider::Heartbeat);
+        }
+        
+        event_loop.loop();
+    }
+};
+```
+
+### Channel 集成
+
+```cpp
+class Channel {
+    // 原来的直接连接方式
+    Channel("127.0.0.1", 10000);
+    
+    // 新的服务发现方式
+    Channel("demo.UserServiceRpc", etcd_client);
+    
+    void CallMethod(...) {
+        if (m_use_discovery) {
+            ResolveService();  // 从 etcd 查地址
+        }
+        // ... 连接并发送 RPC ...
+    }
+};
+```
+
+### 运行结果
+
+```bash
+# 终端 1：启动 etcd
+etcd --data-dir /tmp/etcd-data
+
+# 终端 2：启动 RPC 服务端
+./build/example/server/server -i conf/tinyrpc.conf
+
+# 终端 3：运行客户端
+./build/example/client/client
+
+# 客户端输出：
+[Channel] Discovered demo.UserServiceRpc -> 0.0.0.0:10000
+Response: success=1, errcode=0, errmsg=OK
+
+# 服务端输出：
+[TinyRpc] Registered service: UserServiceRpc
+[TinyRpc] RPC server starting on 0.0.0.0:10000
+[EtcdClient] Registered /tinyrpc/demo.UserServiceRpc -> 0.0.0.0:10000 (lease=..., TTL=10s)
+[UserService] Login called: name=admin, pwd=123456
+```
+
+### 关于 etcd v3 API 的坑
+
+etcd v3 的 HTTP 网关使用 **base64 编码**的 key 和 value，并且 lease ID 在 JSON 响应中是**字符串格式**（不是数字）：
+
+```json
+{"ID":"7587896087936508957","TTL":"10"}   ← ID 是字符串
+```
+
+所以提取时要使用：
+```cpp
+std::string id_str = ExtractJsonString(resp, "ID");  // 正确
+// 而不是：
+std::string id_str = ExtractJsonUint64(resp, "ID");  // 错误
+```
+
+---
+
 # 文件说明
 
 | 文件 | 作用 |
 |------|------|
-| `CMakeLists.txt` | 顶层构建文件，链接 muduo、protobuf |
+| `CMakeLists.txt` | 顶层构建文件，链接 muduo、protobuf、curl |
 | `src/CMakeLists.txt` | 库的构建文件，编译 .cc + .proto |
 | `src/header.proto` | RPC 通信协议定义 |
+| `src/include/EtcdClient.h` | etcd 客户端（服务发现） |
+| `src/EtcdClient.cc` | etcd v3 HTTP API 封装 |
 | `conf/tinyrpc.conf` | 运行时配置 |
 | `demo/user.proto` | 示例业务协议定义 |
 | `example/user_service.h` | 手动实现的 protobuf 服务类 |
-| `example/server/main.cc` | RPC 服务端示例 |
-| `example/client/main.cc` | RPC 客户端示例 |
+| `example/server/main.cc` | RPC 服务端示例（含 etcd 注册） |
+| `example/client/main.cc` | RPC 客户端示例（含 etcd 发现） |
 | `.gitignore` | 排除 build、IDE 等临时文件 |

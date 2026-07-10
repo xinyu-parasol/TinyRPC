@@ -11,12 +11,16 @@
 #include <string>
 #include <unordered_map>
 
+class EtcdClient;
+
 class Provider {
 public:
     void NotifyService(google::protobuf::Service *service);
+    void SetEtcdClient(EtcdClient *client);
     void Run();
 private:
     muduo::net::EventLoop event_loop;
+    EtcdClient *m_etcd_client = nullptr;
     struct ServiceInfo {
         google::protobuf::Service *service;
         std::unordered_map<std::string, const google::protobuf::MethodDescriptor*> method_map;
@@ -24,6 +28,7 @@ private:
     std::unordered_map<std::string, ServiceInfo> service_map;
     void OnConnection(const muduo::net::TcpConnectionPtr &conn);
     void OnMessage(const muduo::net::TcpConnectionPtr &conn, muduo::net::Buffer *buf, muduo::Timestamp time);
+    void Heartbeat();
 };
 
 #endif

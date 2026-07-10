@@ -14,11 +14,15 @@ link_directories(${MUDUO_LIB})
 find_package(Protobuf REQUIRED)
 include_directories(${Protobuf_INCLUDE_DIRS})
 
+find_package(CURL REQUIRED)
+include_directories(${CURL_INCLUDE_DIRS})
+
 set(LIBS
     protobuf
     pthread
     muduo_net
     muduo_base
+    ${CURL_LIBRARIES}
 )
 
 add_subdirectory(src)

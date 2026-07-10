@@ -1,5 +1,6 @@
 #include "Channel.h"
 #include "Controller.h"
+#include "EtcdClient.h"
 #include "header.pb.h"
 #include <sys/socket.h>
 #include <netinet/in.h>
@@ -10,11 +11,49 @@ Channel::Channel(const std::string &ip, uint16_t port)
     : m_ip(ip), m_port(port) {
 }
 
+Channel::Channel(const std::string &service_name, EtcdClient *etcd_client)
+    : m_use_discovery(true)
+    , m_service_name(service_name)
+    , m_etcd_client(etcd_client) {
+}
+
+Channel::~Channel() {
+}
+
+bool Channel::ResolveService() {
+    std::string etcd_key = "/tinyrpc/" + m_service_name;
+    std::string addr = m_etcd_client->DiscoverService(etcd_key);
+    if (addr.empty()) {
+        fprintf(stderr, "[Channel] Service not found: %s\n", m_service_name.c_str());
+        return false;
+    }
+
+    size_t colon = addr.find(':');
+    if (colon == std::string::npos) {
+        fprintf(stderr, "[Channel] Invalid address: %s\n", addr.c_str());
+        return false;
+    }
+
+    m_ip = addr.substr(0, colon);
+    m_port = static_cast<uint16_t>(std::stoi(addr.substr(colon + 1)));
+    printf("[Channel] Discovered %s -> %s:%d\n",
+           m_service_name.c_str(), m_ip.c_str(), m_port);
+    return true;
+}
+
 void Channel::CallMethod(const google::protobuf::MethodDescriptor *method,
                          google::protobuf::RpcController *controller,
                          const google::protobuf::Message *request,
                          google::protobuf::Message *response,
                          google::protobuf::Closure *done) {
+
+    if (m_use_discovery) {
+        if (!ResolveService()) {
+            controller->SetFailed("service discovery failed");
+            return;
+        }
+        m_use_discovery = false;
+    }
 
     int sockfd = ::socket(AF_INET, SOCK_STREAM, 0);
     if (sockfd == -1) {

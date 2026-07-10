@@ -1,6 +1,7 @@
 #include "Provider.h"
 #include "Application.h"
 #include "Controller.h"
+#include "EtcdClient.h"
 #include "header.pb.h"
 #include <muduo/base/Timestamp.h>
 #include <google/protobuf/descriptor.h>
@@ -22,6 +23,10 @@ void Provider::NotifyService(google::protobuf::Service *service) {
 
     service_map[service_name] = service_info;
     printf("[TinyRpc] Registered service: %s\n", service_name.c_str());
+}
+
+void Provider::SetEtcdClient(EtcdClient *client) {
+    m_etcd_client = client;
 }
 
 void Provider::Run() {
@@ -47,7 +52,24 @@ void Provider::Run() {
     server.setThreadNum(4);
     printf("[TinyRpc] RPC server starting on %s:%d\n", ip.c_str(), port);
     server.start();
+
+    if (m_etcd_client) {
+        std::string addr = ip + ":" + std::to_string(port);
+        for (auto &entry : service_map) {
+            std::string full_name = entry.second.service->GetDescriptor()->full_name();
+            std::string etcd_key = "/tinyrpc/" + full_name;
+            m_etcd_client->RegisterService(etcd_key, addr, 10);
+        }
+        event_loop.runEvery(5.0, std::bind(&Provider::Heartbeat, this));
+    }
+
     event_loop.loop();
+}
+
+void Provider::Heartbeat() {
+    if (m_etcd_client) {
+        m_etcd_client->KeepAliveAll();
+    }
 }
 
 void Provider::OnConnection(const muduo::net::TcpConnectionPtr &conn) {
