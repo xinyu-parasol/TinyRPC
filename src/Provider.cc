@@ -43,6 +43,7 @@ void Provider::Run() {
                   std::placeholders::_3)
     );
 
+    setbuf(stdout, NULL);
     server.setThreadNum(4);
     printf("[TinyRpc] RPC server starting on %s:%d\n", ip.c_str(), port);
     server.start();
@@ -60,7 +61,7 @@ void Provider::OnMessage(const muduo::net::TcpConnectionPtr &conn,
                          muduo::Timestamp) {
     while (buf->readableBytes() >= 4) {
         const char *data = buf->peek();
-        uint32_t header_size = *reinterpret_cast<const uint32_t *>(data);
+        uint32_t header_size = ntohl(*reinterpret_cast<const uint32_t *>(data));
 
         if (buf->readableBytes() < 4 + header_size) {
             return;

@@ -340,13 +340,118 @@ recv(sockfd, &buf, 4, MSG_WAITALL);
 
 ---
 
+## Step 5 — 示例程序（端到端跑通）
+
+### 架构图
+
+```
+┌──────────────────────────┐         ┌──────────────────────────┐
+│  Client                  │         │  Server                  │
+│  ┌───────────────────┐   │         │  ┌───────────────────┐   │
+│  │ Channel.cc        │   │  TCP    │  │ Provider.cc       │   │
+│  │ google::protobuf::│   │◄───────►│  │ muduo::TcpServer  │   │
+│  │ RpcChannel 实现   │   │         │  │                   │   │
+│  └────────┬──────────┘   │         │  └────────┬──────────┘   │
+│           │              │         │           │              │
+│  ┌────────▼──────────┐   │         │  ┌────────▼──────────┐   │
+│  │ UserServiceRpc_   │   │         │  │ UserService       │   │
+│  │ Stub (代理)       │   │         │  │ (你的业务代码)    │   │
+│  └────────┬──────────┘   │         │  └───────────────────┘   │
+│           │              │         │                          │
+│  ┌────────▼──────────┐   │         │                          │
+│  │ 你的代码:         │   │         │                          │
+│  │ stub.Login()      │   │         │                          │
+│  └───────────────────┘   │         │                          │
+└──────────────────────────┘         └──────────────────────────┘
+```
+
+### 服务端代码（example/server/main.cc）
+
+```cpp
+class UserService : public demo::UserServiceRpc {
+    void Login(..., const LoginRequest* request,
+               LoginResponse* response, ...) override {
+        // 你的业务逻辑
+        if (name == "admin" && pwd == "123456") {
+            response->set_success(true);
+        }
+    }
+};
+
+int main() {
+    Provider provider;
+    provider.NotifyService(new UserService());  // 注册服务
+    provider.Run();                              // 启动服务器
+}
+```
+
+### 客户端代码（example/client/main.cc）
+
+```cpp
+int main() {
+    Channel channel("127.0.0.1", 10000);    // 连接到服务器
+    UserServiceRpc_Stub stub(&channel);      // 创建代理
+
+    LoginRequest request;                    // 填参数
+    request.set_name("admin");
+    request.set_pwd("123456");
+
+    LoginResponse response;
+    Controller controller;
+    stub.Login(&controller, &request, &response, nullptr);  // 发起 RPC
+
+    if (controller.Failed()) {
+        // 处理网络层错误
+    } else {
+        // 处理业务结果
+        printf("success=%d", response.success());
+    }
+}
+```
+
+### 关于 protobuf 不生成 service 类的问题
+
+在某些 Linux 发行版（如 Fedora）上，`protoc` 编译器默认不生成 `service` 类的 C++ 代码。
+表现为 `.proto` 文件中的 `service UserServiceRpc { ... }` 不会生成对应的 `UserServiceRpc` 和 `UserServiceRpc_Stub` 类。
+
+**解决方案**：手动创建服务类（`example/user_service.h`），核心思路：
+
+1. 继承 `google::protobuf::Service`，实现 `CallMethod`、`GetDescriptor`、`GetRequestPrototype`、`GetResponsePrototype`
+2. 用 `DescriptorPool` 动态构建 `ServiceDescriptor`
+3. 客户端 Stub 将调用转发到 `channel_->CallMethod()`
+
+**这个过程帮助我们理解 protobuf 本来在背后做了什么**：.proto 文件 → protoc → C++ 类（服务和消息），现在我们把"服务"这步手动实现了。
+
+### 运行结果
+
+```bash
+# 终端 1：启动服务端
+./build/example/server/server -i conf/tinyrpc.conf
+
+# 终端 2：运行客户端
+./build/example/client/client
+
+# 客户端输出：
+Response: success=1, errcode=0, errmsg=OK
+
+# 服务端输出：
+[TinyRpc] Registered service: UserServiceRpc
+[TinyRpc] RPC server starting on 0.0.0.0:10000
+[UserService] Login called: name=admin, pwd=123456
+```
+
+---
+
 # 文件说明
 
 | 文件 | 作用 |
 |------|------|
-| `CMakeLists.txt` | 顶层构建文件，链接 muduo、protobuf、glog |
+| `CMakeLists.txt` | 顶层构建文件，链接 muduo、protobuf |
 | `src/CMakeLists.txt` | 库的构建文件，编译 .cc + .proto |
 | `src/header.proto` | RPC 通信协议定义 |
 | `conf/tinyrpc.conf` | 运行时配置 |
 | `demo/user.proto` | 示例业务协议定义 |
+| `example/user_service.h` | 手动实现的 protobuf 服务类 |
+| `example/server/main.cc` | RPC 服务端示例 |
+| `example/client/main.cc` | RPC 客户端示例 |
 | `.gitignore` | 排除 build、IDE 等临时文件 |
