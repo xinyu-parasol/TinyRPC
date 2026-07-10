@@ -716,18 +716,140 @@ Response: success=1, errcode=0, errmsg=OK
 
 ---
 
+## Step 8 — 连接池（Connection Pool）
+
+### 问题
+
+之前每次 `CallMethod` 都做一次完整的 TCP 握手：
+
+```
+CallMethod()
+  ↓ socket()      ← 系统调用
+  ↓ connect()     ← 三次握手 (1 RTT ≈ 0.1~10ms)
+  ↓ send(request)
+  ↓ recv(response)
+  ↓ close()       ← 四次挥手
+```
+
+6 次调用 → 6 次建连。如果客户端频繁发 RPC，光建连接就浪费大量时间。
+
+### 设计
+
+**连接池的核心思想：建好的连接不关，放回池里下次复用。**
+
+```
+CallMethod 1:
+  ↓ pool.Borrow()  → 池空，建新连接 fd=3
+  ↓ send/recv
+  ↓ pool.Return()  → fd=3 放回池里（不 close）
+
+CallMethod 2:
+  ↓ pool.Borrow()  → 池中有 fd=3，直接拿来用（不用建连）
+  ↓ send/recv
+  ↓ pool.Return()  → fd=3 放回池里
+
+CallMethod 3~N:
+  ↓ 同上，持续复用 fd=3
+```
+
+**连接生命周期：**
+```
+Borrow(ip, port)
+  ↓
+m_pools["ip:port"].idle 有闲置连接？  →  弹出并返回
+  ↓ 没有
+创建新 socket + connect  →  返回
+  ↓
+Return(ip, port, sockfd)
+  ↓
+该实例的闲置数 < max_idle?  →  放回 idle 列表
+  ↓ 否
+close(sockfd)
+```
+
+### 为什么是 per-instance 的池？
+
+由于负载均衡，每次可能连到不同的 Server。所以池按 `ip:port` 分级：
+
+```
+m_pools:
+  "127.0.0.1:10000"  →  [fd=3, fd=5]     ← 实例 1 的池
+  "127.0.0.1:10001"  →  [fd=4]            ← 实例 2 的池
+```
+
+`Borrow("127.0.0.1", 10000)` 只去实例 1 的池找，不会拿错连接。
+
+### ConnectionPool 类
+
+```cpp
+class ConnectionPool {
+public:
+    explicit ConnectionPool(size_t max_idle_per_instance = 8);
+    ~ConnectionPool();              // 析构时关闭所有闲置连接
+
+    int Borrow(const std::string &ip, uint16_t port);    // 借连接
+    void Return(const std::string &ip, uint16_t port, int sockfd);  // 归还
+
+private:
+    struct Pool {
+        std::vector<int> idle;      // 闲置的 socket fd 列表
+    };
+
+    size_t m_max_idle;
+    std::mutex m_mutex;             // 线程安全
+    std::unordered_map<std::string, Pool> m_pools;
+
+    int CreateNew(const std::string &ip, uint16_t port);
+};
+```
+
+### Channel 集成
+
+改动很小：把原来 `socket + connect + (send/recv) + close` 换成 `pool.Borrow + (send/recv) + pool.Return`：
+
+```cpp
+void Channel::CallMethod(...) {
+    // ... 选实例（负载均衡）...
+
+    // 原来:
+    // int sockfd = ::socket(AF_INET, SOCK_STREAM, 0);
+    // ::connect(sockfd, ...);
+
+    // 现在:
+    int sockfd = m_pool->Borrow(m_ip, m_port);   // ← 借
+    // ... send / recv（和之前一样）...
+    m_pool->Return(m_ip, m_port, sockfd);         // ← 还
+
+    // 注意：出错时不用 pool.Return，直接 close
+    // 因为断掉的连接不该被复用
+}
+```
+
+### 运行结果
+
+```
+--- Call 1 ---
+[Pool] Created new connection to 127.0.0.1:10000 (fd=3)   ← 首次建连
+[Pool] Return connection to 127.0.0.1:10000 (fd=3) [idle=1]
+
+--- Call 2 ---
+[Pool] Created new connection to 127.0.0.1:10001 (fd=4)   ← 首次建连
+
+--- Call 3 ---
+[Pool] Reuse connection to 127.0.0.1:10000 (fd=3)          ← 复用！
+[Pool] Return connection to 127.0.0.1:10000 (fd=3) [idle=1]
+
+--- Call 4~6 ---
+[Pool] Reuse connection ...                                  ← 全部复用
+```
+
+6 次 RPC 只建了 **2 条连接**，后面 4 次零开销。
+
+---
+
 ## 还可以做什么？
 
-### 1. 连接池（Connection Pool）
-
-当前每次 `CallMethod` 都 `socket()` + `connect()` + `send/recv` + `close()`。效率很低。
-
-**优化方向：**
-- 提前建立一批 TCP 连接到 Server，用完后放回池里
-- 避免重复三次握手四次挥手
-- 典型实现：`std::vector<int> m_pool`，取一个用、用完归还
-
-### 2. 异步 RPC（Async RPC）
+### 1. 异步 RPC（Async RPC）
 
 目前 `CallMethod` 是**同步阻塞**的，等 Server 返回期间客户端啥也干不了。
 
@@ -815,6 +937,8 @@ Response: success=1, errcode=0, errmsg=OK
 | `CMakeLists.txt` | 顶层构建文件，链接 muduo、protobuf、curl |
 | `src/CMakeLists.txt` | 库的构建文件，编译 .cc + .proto |
 | `src/header.proto` | RPC 通信协议定义 |
+| `src/include/ConnectionPool.h` | 连接池（借/还 TCP 连接） |
+| `src/ConnectionPool.cc` | 连接池实现 |
 | `src/include/EtcdClient.h` | etcd 客户端（服务发现） |
 | `src/EtcdClient.cc` | etcd v3 HTTP API 封装 |
 | `conf/tinyrpc.conf` | 运行时配置（实例1） |
@@ -822,5 +946,5 @@ Response: success=1, errcode=0, errmsg=OK
 | `demo/user.proto` | 示例业务协议定义 |
 | `example/user_service.h` | 手动实现的 protobuf 服务类 |
 | `example/server/main.cc` | RPC 服务端示例（含 etcd 注册） |
-| `example/client/main.cc` | RPC 客户端示例（含 etcd 发现 + 负载均衡） |
+| `example/client/main.cc` | RPC 客户端示例（含 etcd 发现 + 负载均衡 + 连接池） |
 | `.gitignore` | 排除 build、IDE 等临时文件 |

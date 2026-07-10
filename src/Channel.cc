@@ -1,6 +1,7 @@
 #include "Channel.h"
 #include "Controller.h"
 #include "EtcdClient.h"
+#include "ConnectionPool.h"
 #include "header.pb.h"
 #include <sys/socket.h>
 #include <netinet/in.h>
@@ -11,6 +12,7 @@
 
 Channel::Channel(const std::string &ip, uint16_t port)
     : m_ip(ip), m_port(port) {
+    m_pool = new ConnectionPool();
 }
 
 Channel::Channel(const std::string &service_name, EtcdClient *etcd_client)
@@ -18,9 +20,11 @@ Channel::Channel(const std::string &service_name, EtcdClient *etcd_client)
     , m_service_name(service_name)
     , m_etcd_client(etcd_client) {
     std::srand(std::time(nullptr));
+    m_pool = new ConnectionPool();
 }
 
 Channel::~Channel() {
+    delete m_pool;
 }
 
 bool Channel::ResolveAllInstances() {
@@ -72,24 +76,9 @@ void Channel::CallMethod(const google::protobuf::MethodDescriptor *method,
         printf("[Channel] Selected instance [%zu] %s:%d\n", idx, m_ip.c_str(), m_port);
     }
 
-    int sockfd = ::socket(AF_INET, SOCK_STREAM, 0);
+    int sockfd = m_pool->Borrow(m_ip, m_port);
     if (sockfd == -1) {
-        controller->SetFailed("socket() error");
-        return;
-    }
-
-    struct sockaddr_in addr;
-    addr.sin_family = AF_INET;
-    addr.sin_port = htons(m_port);
-    if (inet_pton(AF_INET, m_ip.c_str(), &addr.sin_addr) <= 0) {
-        controller->SetFailed("inet_pton() error");
-        ::close(sockfd);
-        return;
-    }
-
-    if (::connect(sockfd, (struct sockaddr *)&addr, sizeof(addr)) == -1) {
-        controller->SetFailed("connect() error");
-        ::close(sockfd);
+        controller->SetFailed("borrow connection failed");
         return;
     }
 
@@ -146,11 +135,10 @@ void Channel::CallMethod(const google::protobuf::MethodDescriptor *method,
         return;
     }
 
+    m_pool->Return(m_ip, m_port, sockfd);
+
     if (!response->ParseFromString(response_str)) {
         controller->SetFailed("deserialize response error");
-        ::close(sockfd);
         return;
     }
-
-    ::close(sockfd);
 }

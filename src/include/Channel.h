@@ -6,6 +6,7 @@
 #include <vector>
 
 class EtcdClient;
+class ConnectionPool;
 
 class Channel : public google::protobuf::RpcChannel {
 public:
@@ -32,6 +33,8 @@ private:
     std::string m_service_name;
     EtcdClient *m_etcd_client = nullptr;
     std::vector<std::string> m_instances;
+
+    ConnectionPool *m_pool = nullptr;
 };
 
 #endif
